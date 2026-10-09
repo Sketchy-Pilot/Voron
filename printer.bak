@@ -478,82 +478,47 @@ gcode:
     SET_HEATER_TEMPERATURE HEATER=heater_bed TARGET=0
 
 [gcode_macro CLEAN_NOZZLE]
-description: Purge at hot temp, then wipe on the brush while cooling the active nozzle (START_TEMP -> END_TEMP)
+description: Purge and wipe the active toolhead nozzle over the brush and bucket
 gcode:
   # 1. DEFINE COORDINATES & PARAMETERS
-  {% set START_TEMP = params.START_TEMP | default(260) | float %}   # Purge temperature
-  {% set END_TEMP = params.END_TEMP | default(150) | float %}      # Keep wiping until nozzle is at/below this
-  {% set WIPE_DROP = params.WIPE_DROP | default(50) | float %}     # Stop wiping once this many degrees below START_TEMP
-  {% set RESTORE = params.RESTORE | default(1) | int %}            # 1 = restore previous heater target afterwards
   {% set BUCKET_X = 290 %}      # Bucket is on the positive side of the 250-280 brush
   {% set BRUSH_START_X = 250 %}
   {% set BRUSH_END_X = 280 %}
   {% set WIPE_Y = -12.0 %}
   {% set WIPE_Z = -1.5 %}
   {% set CLEAR_Z = 5.0 %}       # Safe travel height above the brush/frame
-  {% set WIPE_END_TEMP = START_TEMP - WIPE_DROP %}
-  {% set MAX_CHUNKS = 60 %}     # Safety limit: ~3 s of wiping per chunk
-
+  {% set WIPE_COUNT = 6 %}      # Number of back-and-forth wiping cycles
+  
   # Get active extruder name dynamically for multi-tool setups
   {% set active_extruder = printer.toolhead.extruder %}
-  {% set prev_target = printer[active_extruder].target | float %}
 
-  {action_respond_info("Cleaning active tool nozzle (%s): purge at %d, wipe down to %d" % (active_extruder, START_TEMP, END_TEMP))}
-  SAVE_GCODE_STATE NAME=CLEAN_NOZZLE_STATE
-
-  # 2. HEAT TO PURGE TEMP WHILE MOVING TO BUCKET
-  SET_HEATER_TEMPERATURE HEATER={active_extruder} TARGET={START_TEMP}
+  # 2. MOVE TO BUCKET & PURGE
+  {action_respond_info("Cleaning active tool nozzle...")}
   G90                              ; Absolute positioning
   G0 Z{CLEAR_Z} F3000              ; Lift toolhead to clear height
-  G0 X{BUCKET_X} Y{WIPE_Y} F18000  ; Fast travel to the bucket area
-  TEMPERATURE_WAIT SENSOR={active_extruder} MINIMUM={START_TEMP - 3}
-
-  # 3. PURGE
-  M83                              ; Relative extrusion
-  G92 E0
+  G0 X{BUCKET_X} Y{WIPE_Y} F18000   ; Fast travel to the bucket area
+  
+  G91                              ; Relative extrusion/motion
   G1 E15.0 F150                    ; Purge 15mm of filament into the bucket
-  G1 E-5.0 F1800                   ; Retract 5mm to prevent oozing
+  G1 E-5.0 F150                    ; Retrace 5mm to prevent oozing
   G92 E0                           ; Zero extruder
-  G4 P500                          ; Dwell 0.5 s to let the purge string settle
-
-  # 4. START COOLING AND WIPE UNTIL WIPE_END_TEMP IS REACHED
-  SET_HEATER_TEMPERATURE HEATER={active_extruder} TARGET={END_TEMP}
+  G4 P500                         ; Dwell for 2 seconds to let the purge string cool/settle
+  
+  # 3. LOWER TO BRUSH AND WIPE
   G90                              ; Absolute positioning
   G0 Z{WIPE_Z} F3000               ; Lower nozzle into the bristles
-  G0 X{BRUSH_END_X} F12000         ; Move to the brush edge closest to the bucket
-  {% for i in range(MAX_CHUNKS) %}
-    _CLEAN_NOZZLE_WIPE EXTRUDER={active_extruder} END_TEMP={WIPE_END_TEMP} X1={BRUSH_START_X} X2={BRUSH_END_X}
+  G0 X{BRUSH_END_X} F12000         ; Move to the brush start edge closest to the bucket
+
+  # Back and forth wiping loop
+  {% for i in range(WIPE_COUNT) %}
+    G0 X{BRUSH_START_X} F12000
+    G0 X{BRUSH_END_X} F12000
   {% endfor %}
 
-  # 5. PARK OVER THE BIN AND FINISH COOLING TO END_TEMP
+  # 4. EXIT SAFELY
   G0 Z{CLEAR_Z} F3000              ; Lift clear of the bristles
-  G0 X{BUCKET_X} Y{WIPE_Y} F18000  ; Park over the bucket so any ooze drips in the bin
-  TEMPERATURE_WAIT SENSOR={active_extruder} MAXIMUM={END_TEMP + 1}
-
-  # 6. EXIT
-  {% if RESTORE == 1 %}
-    SET_HEATER_TEMPERATURE HEATER={active_extruder} TARGET={prev_target}
-  {% endif %}
-  RESTORE_GCODE_STATE NAME=CLEAN_NOZZLE_STATE
+  G92 E0                           ; Final extruder reset
   {action_respond_info("Nozzle cleaning complete.")}
-
-# Helper: does ~3 s of wiping ONLY if the nozzle is still above END_TEMP.
-# CLEAN_NOZZLE calls it repeatedly; each call renders at run time, so it sees
-# the live temperature (Klipper does not allow macros to call themselves).
-[gcode_macro _CLEAN_NOZZLE_WIPE]
-gcode:
-  {% set end_temp = params.END_TEMP | float %}
-  {% set x1 = params.X1 | float %}
-  {% set x2 = params.X2 | float %}
-  {% set y1 = params.Y1 | default(-12) | float %}
-  {% set y2 = params.Y2 | default(-10) | float %}
-  {% if printer[params.EXTRUDER].temperature | float > end_temp + 1.0 %}
-    {% for i in range(5) %}
-      G0 X{x1} Y{y2} F6000
-      G0 X{x2} Y{y1} F6000
-    {% endfor %}
-  {% endif %}
-
 
 [gcode_macro PRINT_START]
 gcode:
@@ -621,9 +586,7 @@ gcode:
 
   M117 Quad Gantry Level
   QUAD_GANTRY_LEVEL
-  CLEAN_NOZZLE
-  QUAD_GANTRY_LEVEL
-  
+
   G28 Z ; Home Z again after QGL
 
   BED_MESH_CALIBRATE ADAPTIVE=1 ; Run adaptive bed mesh
