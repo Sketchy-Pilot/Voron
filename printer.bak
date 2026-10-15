@@ -422,7 +422,48 @@ gcode:
 [gcode_macro _HEAT_SOAK_VARIABLES]
 variable_time_remaining: 0
 variable_manual_soak_active: 0  # 0 = No manual soak, 1 = Manual soak in progress
+variable_elapsed: 0             # Seconds into the current print soak
+variable_last_temp: -100.0      # Chamber temp at the last 1-minute sample
+variable_stable_count: 0        # Consecutive minutes with < 0.3C rise
+variable_done: 0
 gcode:
+
+[gcode_macro _SOAK_TICK]
+description: One 15 s step of the print heat soak. Does nothing once the soak is done.
+gcode:
+  {% set v = printer["gcode_macro _HEAT_SOAK_VARIABLES"] %}
+  {% if v.done == 0 %}
+    {% set target = params.TARGET | float %}
+    {% set min_s = (params.MIN | float * 60) | int %}
+    {% set max_s = (params.MAX | float * 60) | int %}
+    {% set chamber = printer["temperature_sensor chamber"].temperature | float %}
+    {% set elapsed = v.elapsed | int %}
+    {% set stable = v.stable_count | int %}
+
+    # Once a minute, check whether the chamber has stopped rising
+    {% if elapsed % 60 == 0 %}
+      {% set stable = stable + 1 if chamber - v.last_temp < 0.3 else 0 %}
+      SET_GCODE_VARIABLE MACRO=_HEAT_SOAK_VARIABLES VARIABLE=last_temp VALUE={chamber}
+      SET_GCODE_VARIABLE MACRO=_HEAT_SOAK_VARIABLES VARIABLE=stable_count VALUE={stable}
+    {% endif %}
+
+    {% if elapsed >= max_s %}
+      {action_respond_info("Heat soak hit the %d min limit (chamber %.1fC). Continuing." % (max_s // 60, chamber))}
+      SET_GCODE_VARIABLE MACRO=_HEAT_SOAK_VARIABLES VARIABLE=done VALUE=1
+    {% elif elapsed >= min_s and chamber >= target %}
+      {action_respond_info("Chamber reached %.1fC after %d min. Heat soak complete." % (chamber, elapsed // 60))}
+      SET_GCODE_VARIABLE MACRO=_HEAT_SOAK_VARIABLES VARIABLE=done VALUE=1
+    {% elif elapsed >= min_s and stable >= 3 %}
+      {action_respond_info("Chamber leveled off at %.1fC after %d min. Heat soak complete." % (chamber, elapsed // 60))}
+      SET_GCODE_VARIABLE MACRO=_HEAT_SOAK_VARIABLES VARIABLE=done VALUE=1
+    {% else %}
+      {% if elapsed % 60 == 0 %}
+        {action_respond_info("Heat soaking: %d min, chamber %.1f / %.0fC" % (elapsed // 60, chamber, target))}
+      {% endif %}
+      G4 P15000
+      SET_GCODE_VARIABLE MACRO=_HEAT_SOAK_VARIABLES VARIABLE=elapsed VALUE={elapsed + 15}
+    {% endif %}
+  {% endif %}
 
 [gcode_macro HEAT_SOAK]
 description: Pre-heat the bed and start a heat soak before starting a print
@@ -449,25 +490,17 @@ gcode:
 [delayed_gcode heat_soak_timer]
 gcode:
     {% set remaining = printer["gcode_macro _HEAT_SOAK_VARIABLES"].time_remaining | int %}
-    {% set manual_active = printer["gcode_macro _HEAT_SOAK_VARIABLES"].manual_soak_active | int %}
-    
+
     {% if remaining > 0 %}
         {% set remaining = remaining - 1 %}
         SET_GCODE_VARIABLE MACRO=_HEAT_SOAK_VARIABLES VARIABLE=time_remaining VALUE={remaining}
-        
+
         {% if remaining > 0 %}
             {action_respond_info("Heat soaking... %d minutes remaining." % remaining)}
             UPDATE_DELAYED_GCODE ID=heat_soak_timer DURATION=60
         {% else %}
-            # Countdown hit 0! Check how we started it.
-            {% if manual_active == 1 %}
-                {action_respond_info("Manual heat soak complete! Bed will stay hot until you start a print.")}
-                # Reset the manual flag now that it finished its countdown
-                SET_GCODE_VARIABLE MACRO=_HEAT_SOAK_VARIABLES VARIABLE=manual_soak_active VALUE=0
-            {% else %}
-                {action_respond_info("Automatic heat soak complete! Resuming print sequence.")}
-                _START_PRINT_POST_SOAK
-            {% endif %}
+            {action_respond_info("Manual heat soak complete! Bed will stay hot until you start a print.")}
+            SET_GCODE_VARIABLE MACRO=_HEAT_SOAK_VARIABLES VARIABLE=manual_soak_active VALUE=0
         {% endif %}
     {% endif %}
 
@@ -478,70 +511,106 @@ gcode:
     SET_HEATER_TEMPERATURE HEATER=heater_bed TARGET=0
 
 [gcode_macro CLEAN_NOZZLE]
-description: Purge and wipe the active toolhead nozzle over the brush and bucket
+description: Purge at hot temp, then wipe on the brush while cooling the active nozzle (START_TEMP -> END_TEMP)
 gcode:
   # 1. DEFINE COORDINATES & PARAMETERS
+  {% set START_TEMP = params.START_TEMP | default(260) | float %}   # Purge temperature
+  {% set END_TEMP = params.END_TEMP | default(150) | float %}      # Keep wiping until nozzle is at/below this
+  {% set WIPE_DROP = params.WIPE_DROP | default(50) | float %}     # Stop wiping once this many degrees below START_TEMP
+  {% set RESTORE = params.RESTORE | default(1) | int %}            # 1 = restore previous heater target afterwards
   {% set BUCKET_X = 290 %}      # Bucket is on the positive side of the 250-280 brush
   {% set BRUSH_START_X = 250 %}
   {% set BRUSH_END_X = 280 %}
   {% set WIPE_Y = -12.0 %}
   {% set WIPE_Z = -1.5 %}
   {% set CLEAR_Z = 5.0 %}       # Safe travel height above the brush/frame
-  {% set WIPE_COUNT = 6 %}      # Number of back-and-forth wiping cycles
-  
+  {% set WIPE_END_TEMP = START_TEMP - WIPE_DROP %}
+  {% set MAX_CHUNKS = 60 %}     # Safety limit: ~3 s of wiping per chunk
+
   # Get active extruder name dynamically for multi-tool setups
   {% set active_extruder = printer.toolhead.extruder %}
+  {% set prev_target = printer[active_extruder].target | float %}
 
-  # 2. MOVE TO BUCKET & PURGE
-  {action_respond_info("Cleaning active tool nozzle...")}
+  {action_respond_info("Cleaning active tool nozzle (%s): purge at %d, wipe down to %d" % (active_extruder, START_TEMP, END_TEMP))}
+  SAVE_GCODE_STATE NAME=CLEAN_NOZZLE_STATE
+
+  # 2. HEAT TO PURGE TEMP WHILE MOVING TO BUCKET
+  SET_HEATER_TEMPERATURE HEATER={active_extruder} TARGET={START_TEMP}
   G90                              ; Absolute positioning
   G0 Z{CLEAR_Z} F3000              ; Lift toolhead to clear height
-  G0 X{BUCKET_X} Y{WIPE_Y} F18000   ; Fast travel to the bucket area
-  
-  G91                              ; Relative extrusion/motion
+  G0 X{BUCKET_X} Y{WIPE_Y} F18000  ; Fast travel to the bucket area
+  TEMPERATURE_WAIT SENSOR={active_extruder} MINIMUM={START_TEMP - 3}
+
+  # 3. PURGE
+  M83                              ; Relative extrusion
+  G92 E0
   G1 E15.0 F150                    ; Purge 15mm of filament into the bucket
-  G1 E-5.0 F150                    ; Retrace 5mm to prevent oozing
+  G1 E-5.0 F1800                   ; Retract 5mm to prevent oozing
   G92 E0                           ; Zero extruder
-  G4 P500                         ; Dwell for 2 seconds to let the purge string cool/settle
-  
-  # 3. LOWER TO BRUSH AND WIPE
+  G4 P500                          ; Dwell 0.5 s to let the purge string settle
+
+  # 4. START COOLING AND WIPE UNTIL WIPE_END_TEMP IS REACHED
+  SET_HEATER_TEMPERATURE HEATER={active_extruder} TARGET={END_TEMP}
   G90                              ; Absolute positioning
   G0 Z{WIPE_Z} F3000               ; Lower nozzle into the bristles
-  G0 X{BRUSH_END_X} F12000         ; Move to the brush start edge closest to the bucket
-
-  # Back and forth wiping loop
-  {% for i in range(WIPE_COUNT) %}
-    G0 X{BRUSH_START_X} F12000
-    G0 X{BRUSH_END_X} F12000
+  G0 X{BRUSH_END_X} F12000         ; Move to the brush edge closest to the bucket
+  {% for i in range(MAX_CHUNKS) %}
+    _CLEAN_NOZZLE_WIPE EXTRUDER={active_extruder} END_TEMP={WIPE_END_TEMP} X1={BRUSH_START_X} X2={BRUSH_END_X}
   {% endfor %}
 
-  # 4. EXIT SAFELY
+  # 5. PARK OVER THE BIN AND FINISH COOLING TO END_TEMP
   G0 Z{CLEAR_Z} F3000              ; Lift clear of the bristles
-  G92 E0                           ; Final extruder reset
+  G0 X{BUCKET_X} Y{WIPE_Y} F18000  ; Park over the bucket so any ooze drips in the bin
+  TEMPERATURE_WAIT SENSOR={active_extruder} MAXIMUM={END_TEMP + 1}
+
+  # 6. EXIT
+  {% if RESTORE == 1 %}
+    SET_HEATER_TEMPERATURE HEATER={active_extruder} TARGET={prev_target}
+  {% endif %}
+  RESTORE_GCODE_STATE NAME=CLEAN_NOZZLE_STATE
   {action_respond_info("Nozzle cleaning complete.")}
+
+# Helper: does ~3 s of wiping ONLY if the nozzle is still above END_TEMP.
+# CLEAN_NOZZLE calls it repeatedly; each call renders at run time, so it sees
+# the live temperature (Klipper does not allow macros to call themselves).
+[gcode_macro _CLEAN_NOZZLE_WIPE]
+gcode:
+  {% set end_temp = params.END_TEMP | float %}
+  {% set x1 = params.X1 | float %}
+  {% set x2 = params.X2 | float %}
+  {% set y1 = params.Y1 | default(-12) | float %}
+  {% set y2 = params.Y2 | default(-10) | float %}
+  {% if printer[params.EXTRUDER].temperature | float > end_temp + 1.0 %}
+    {% for i in range(5) %}
+      G0 X{x1} Y{y2} F6000
+      G0 X{x2} Y{y1} F6000
+    {% endfor %}
+  {% endif %}
+
 
 [gcode_macro PRINT_START]
 gcode:
   # Gather all variables
-  {% set TOOL = params.TOOL | default(0)| int %}
+  {% set TOOL = params.TOOL | default(0) | int %}
   {% set TOOL_TEMP = params.TOOL_TEMP | default(0) | int %}
   {% set BED_TEMP = params.BED_TEMP | default(0) | int %}
-  {% set SOAK_MINUTES = params.SOAK | default(15) | int %}
+  {% set CHAMBER = params.CHAMBER | default(0) | float %}     # 0 = no soak (PLA etc.)
+  {% set SOAK_MIN = params.SOAK_MIN | default(10) | float %}  # Minutes, covers frame lag
+  {% set SOAK_MAX = params.SOAK_MAX | default(45) | float %}  # Minutes, hard cap
 
-  # Read our check flags
-  {% set bed_already_soaked = printer["delayed_gcode cooldown_bed_timer"].duration | float > 0 %}
-  {% set manual_soak_running = printer["gcode_macro _HEAT_SOAK_VARIABLES"].manual_soak_active | int == 1 %}
-  {% set manual_soak_time_left = printer["gcode_macro _HEAT_SOAK_VARIABLES"].time_remaining | int %}
+  # Snapshot temperatures BEFORE heating to judge whether we're already soaked
+  {% set chamber_now = printer["temperature_sensor chamber"].temperature | float %}
+  {% set bed_now = printer.heater_bed.temperature | float %}
+  {% set bed_was_hot = bed_now >= BED_TEMP - 5 %}
+  {% set chamber_warm = chamber_now >= CHAMBER - 2 %}
 
-  # Kill any cooldown or active background soak timers now that a real job is beginning
+  # Stop any manual soak or cooldown timers now that a real job is beginning
   UPDATE_DELAYED_GCODE ID=cooldown_bed_timer DURATION=0
   UPDATE_DELAYED_GCODE ID=heat_soak_timer DURATION=0
-  
-  # Reset the manual flag state back to 0
   SET_GCODE_VARIABLE MACRO=_HEAT_SOAK_VARIABLES VARIABLE=manual_soak_active VALUE=0
   SET_GCODE_VARIABLE MACRO=_HEAT_SOAK_VARIABLES VARIABLE=time_remaining VALUE=0
 
-  # Save variables so the post-soak macro can read them later
+  # Save variables for the post-soak macro
   SET_GCODE_VARIABLE MACRO=_START_PRINT_POST_SOAK VARIABLE=tool VALUE={TOOL}
   SET_GCODE_VARIABLE MACRO=_START_PRINT_POST_SOAK VARIABLE=tool_temp VALUE={TOOL_TEMP}
 
@@ -553,21 +622,26 @@ gcode:
   M117 Heating Bed
   M190 S{BED_TEMP}
 
-  # Determine if we should soak, finish a manual soak, or skip entirely
-  {% if bed_already_soaked %}
-      {action_respond_info("Recent print detected. Gantry is already hot, skipping heat soak!")}
-      _START_PRINT_POST_SOAK
-  {% elif manual_soak_running and manual_soak_time_left > 0 %}
-      {action_respond_info("Manual soak was in progress. Transferring control and finishing remaining %d minutes..." % manual_soak_time_left)}
-      SET_GCODE_VARIABLE MACRO=_HEAT_SOAK_VARIABLES VARIABLE=time_remaining VALUE={manual_soak_time_left}
-      UPDATE_DELAYED_GCODE ID=heat_soak_timer DURATION=60
-  {% elif SOAK_MINUTES > 0 %}
-      {action_respond_info("Printer was cold. Starting %d minute heat soak..." % SOAK_MINUTES)}
-      SET_GCODE_VARIABLE MACRO=_HEAT_SOAK_VARIABLES VARIABLE=time_remaining VALUE={SOAK_MINUTES}
-      UPDATE_DELAYED_GCODE ID=heat_soak_timer DURATION=60
+  # Decide whether to soak
+  {% if CHAMBER <= 0 %}
+    {action_respond_info("No chamber target for this filament. Skipping heat soak.")}
+  {% elif bed_was_hot and chamber_warm %}
+    {action_respond_info("Already soaked (bed %.0fC, chamber %.1fC). Skipping heat soak." % (bed_now, chamber_now))}
   {% else %}
-      _START_PRINT_POST_SOAK
+    # Chamber already warm but bed was cold: short soak so the bed plate settles
+    {% set min_minutes = [SOAK_MIN, 5] | min if chamber_warm else SOAK_MIN %}
+    {action_respond_info("Heat soaking to %.0fC chamber (min %d, max %d min)..." % (CHAMBER, min_minutes, SOAK_MAX))}
+    SET_GCODE_VARIABLE MACRO=_HEAT_SOAK_VARIABLES VARIABLE=elapsed VALUE=0
+    SET_GCODE_VARIABLE MACRO=_HEAT_SOAK_VARIABLES VARIABLE=last_temp VALUE=-100
+    SET_GCODE_VARIABLE MACRO=_HEAT_SOAK_VARIABLES VARIABLE=stable_count VALUE=0
+    SET_GCODE_VARIABLE MACRO=_HEAT_SOAK_VARIABLES VARIABLE=done VALUE=0
+    M117 Heat soaking
+    {% for i in range((SOAK_MAX * 4) | int + 1) %}
+      _SOAK_TICK TARGET={CHAMBER} MIN={min_minutes} MAX={SOAK_MAX}
+    {% endfor %}
   {% endif %}
+
+  _START_PRINT_POST_SOAK
 
 
 [gcode_macro _START_PRINT_POST_SOAK]
@@ -578,6 +652,8 @@ gcode:
   # Retrieve saved variables
   {% set TOOL = printer["gcode_macro _START_PRINT_POST_SOAK"].tool | int %}
   {% set TOOL_TEMP = printer["gcode_macro _START_PRINT_POST_SOAK"].tool_temp | int %}
+  # Purge T0 at the filament temp if T0 is the printing tool, otherwise use the macro default
+  {% set CLEAN_TEMP = TOOL_TEMP if (TOOL == 0 and TOOL_TEMP > 0) else 260 %}
 
   M117 Homing
   G28
@@ -586,6 +662,10 @@ gcode:
 
   M117 Quad Gantry Level
   QUAD_GANTRY_LEVEL
+  G28 Z ; Re-home Z so the brush height is correct after leveling
+
+  M117 Cleaning Nozzle
+  CLEAN_NOZZLE START_TEMP={CLEAN_TEMP} RESTORE=0
 
   G28 Z ; Home Z again after QGL
 
@@ -605,42 +685,43 @@ gcode:
     START_CRASH_DETECTION
   {% endif %}
 
-
 [gcode_macro PRINT_END]
 gcode:
   {% set th = printer.toolhead %}
   {% set x_safe = th.position.x + 20 * (1 if th.axis_maximum.x - th.position.x > 20 else -1) %}
   {% set y_safe = th.position.y + 20 * (1 if th.axis_maximum.y - th.position.y > 20 else -1) %}
-  {% set z_safe = [th.position.z + 2, th.axis_maximum.z]|min %}
+  {% set z_safe = [th.position.z + 2, th.axis_maximum.z] | min %}
 
-  M220 S100 ; Set Feed rate to 100%
-  M221 S100 ; Set Flow rate to 100%
+  M220 S100 ; Set feed rate to 100%
+  M221 S100 ; Set flow rate to 100%
 
   SET_PRESSURE_ADVANCE ADVANCE=0 ; Disable pressure advance
 
-  G92 E0 ; zero the extruder
-  G1 E-2.0 F3600 ; retract filament
-  M400 ; wait for buffer to clear
+  # Retract only if the nozzle is hot enough to extrude
+  {% if printer[th.extruder].can_extrude %}
+    G92 E0 ; Zero the extruder
+    G1 E-2.0 F3600 ; Retract filament
+  {% endif %}
+  M400 ; Wait for buffer to clear
 
   T0 ; Switch to tool 0
 
-  G90 ; absolute positioning
-  G0 X{x_safe} Y{y_safe} Z{z_safe} F20000 ; move nozzle to remove stringing
-  G0 X{th.axis_maximum.x//2} Y{th.axis_maximum.y - 2} F3600 ; park nozzle at rear
+  G90 ; Absolute positioning
+  G0 X{x_safe} Y{y_safe} Z{z_safe} F20000 ; Move nozzle to break stringing
+  G0 X{th.axis_maximum.x//2} Y{th.axis_maximum.y - 2} F3600 ; Park nozzle at rear
 
-  SET_GCODE_OFFSET X=0.0 Y=0.0 Z=0.0 ; reset gcode offset
+  SET_GCODE_OFFSET X=0.0 Y=0.0 Z=0.0 ; Reset gcode offset
 
   {% for tn in printer.toolchanger.tool_numbers %}
-      M104 S0 T{tn} ; shutdown tool heater
-      M107 T{tn} ; shutdown tool fan
-      SET_STEPPER_ENABLE STEPPER=extruder{tn if tn > 0 else ''} ENABLE=0 ; disable extruder stepper
+    M104 S0 T{tn} ; Shut down tool heater
+    M107 T{tn} ; Shut down tool fan
+    SET_STEPPER_ENABLE STEPPER=extruder{tn if tn > 0 else ''} ENABLE=0 ; Disable extruder stepper
   {% endfor %}
-   
-# Keep the bed at its current temperature (Do NOT turn it off here!)
+
+  # Keep the bed hot (do NOT turn it off here) and start the 1-hour cooldown timer
   {action_respond_info("Keeping bed heated. 1-hour cooldown timer started.")}
-    
-# Trigger the non-blocking 1-hour countdown timer (3600 seconds)
-   UPDATE_DELAYED_GCODE ID=cooldown_bed_timer DURATION=3600
+  UPDATE_DELAYED_GCODE ID=cooldown_bed_timer DURATION=3600
+
 
 [gcode_macro CANCEL_PRINT]
 description: Safely cancel the running print job and reset all macro timers
@@ -666,10 +747,12 @@ gcode:
 
   # 3. SAFE TOOLHEAD RETRACTION & PARKING
   {% if printer.toolhead.homed_axes == "xyz" %}
-      G92 E0                         ; Zero the extruder
-      G1 E-4.0 F3600                 ; Retract filament significantly to prevent blobs/oozing
-      M400                           ; Wait for movement buffer to clear
-      
+      {% if printer[printer.toolhead.extruder].can_extrude %}
+          G92 E0                     ; Zero the extruder
+          G1 E-4.0 F3600             ; Retract filament to prevent blobs/oozing
+          M400                       ; Wait for movement buffer to clear
+      {% endif %}
+
       G90                            ; Absolute positioning
       G0 X{x_safe} Y{y_safe} Z{z_safe} F20000 ; Quick jerk away to break string
       G0 X{th.axis_maximum.x//2} Y{th.axis_maximum.y - 2} F3600 ; Park gantry at center-rear
@@ -684,8 +767,8 @@ gcode:
   TURN_OFF_HEATERS               ; Shuts down bed and all active tools completely
   M107                           ; Turn off part cooling fans
   
-  # Toolchanger Specific Shutdown Loop (matches your PRINT_END)
-  {% if printer.toolchanger is defined %}
+  # Toolchanger Specific Shutdown Loop (only if the toolchanger is ready)
+  {% if printer.toolchanger is defined and printer.toolchanger.status == 'ready' and printer.toolhead.homed_axes == "xyz" %}
       T0 ; Switch back to base tool 0 safely
       {% for tn in printer.toolchanger.tool_numbers %}
           M104 S0 T{tn}          ; Ensure all tool heaters are killed
