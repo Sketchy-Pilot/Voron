@@ -77,11 +77,12 @@ managed_services = klipper
 
 [webcam umbilical]
 location = printer
-service = mjpegstreamer-adaptive
+service = mjpegstreamer
 target_fps = 15
 target_fps_idle = 5
 aspect_ratio = 16:9
 flip_vertical = true
+flip_horizontal = true
 stream_url = /webcam/?action=stream
 snapshot_url = /webcam/?action=snapshot
 
@@ -146,4 +147,21 @@ url = ntfys://ntfy.dumplingmanor.com/voron?token={secrets.ntfy.token}&priority=l
 events = gcode
 title = Bed cooled down
 body = {event_message}
+
+[update_manager nfc2klipper]
+type = git_repo
+channel = dev
+path = ~/nfc2klipper
+origin = https://github.com/bofh69/nfc2klipper.git
+primary_branch = main
+virtualenv = ~/nfc2klipper/venv
+requirements = requirements.txt
+managed_services = nfc2klipper
+info_tags = 
+	desc=nfc2klipper
+
+[webcam nfc_tags]
+service = iframe
+stream_url = http://voron.internal:5001/
+aspect_ratio = 4:3
 
